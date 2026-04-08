@@ -44,6 +44,8 @@ issues = "https://github.com/googleanalytics/google-analytics-mcp/issues"
 analytics-mcp = "analytics_mcp.server:run_server"
 # The previous name of the script. Kept for backwards compatibility.
 google-analytics-mcp = "analytics_mcp.server:run_server"
+# HTTP transport for remote deployment (Railway, etc.)
+analytics-mcp-http = "analytics_mcp.server:run_http_server"
 
 [project.optional-dependencies]
 dev = ["black", "nox >=2026.2.9, <2027"]
