@@ -24,6 +24,7 @@ Supports two transports:
 
 import asyncio
 import contextlib
+import hashlib
 import json
 import os
 import tempfile
@@ -95,9 +96,19 @@ def _setup_google_credentials():
         )
 
 
-def _get_auth_token() -> str | None:
-    """Return the expected bearer token, or None if auth is disabled."""
-    return os.environ.get("MCP_AUTH_TOKEN")
+def _get_oauth_config() -> tuple[str | None, str | None]:
+    """Return (client_id, client_secret) from env, or (None, None)."""
+    return (
+        os.environ.get("OAUTH_CLIENT_ID"),
+        os.environ.get("OAUTH_CLIENT_SECRET"),
+    )
+
+
+def _make_access_token(client_secret: str) -> str:
+    """Derive a deterministic access token from the client secret."""
+    return hashlib.sha256(
+        f"mcp-access-{client_secret}".encode()
+    ).hexdigest()
 
 
 def run_http_server():
@@ -111,7 +122,10 @@ def run_http_server():
 
     _setup_google_credentials()
 
-    auth_token = _get_auth_token()
+    client_id, client_secret = _get_oauth_config()
+    access_token = (
+        _make_access_token(client_secret) if client_secret else None
+    )
 
     session_manager = StreamableHTTPSessionManager(
         app=coordinator.app,
@@ -119,58 +133,160 @@ def run_http_server():
         stateless=True,
     )
 
-    # -- ASGI middleware: bearer token auth + path routing ---------------
+    # -- Helpers -----------------------------------------------------------
+
+    async def _send_json(send, status, body):
+        data = json.dumps(body).encode()
+        await send(
+            {
+                "type": "http.response.start",
+                "status": status,
+                "headers": [
+                    [b"content-type", b"application/json"],
+                ],
+            }
+        )
+        await send({"type": "http.response.body", "body": data})
+
+    async def _send_text(send, status, text):
+        await send(
+            {
+                "type": "http.response.start",
+                "status": status,
+                "headers": [
+                    [b"content-type", b"text/plain"],
+                ],
+            }
+        )
+        await send(
+            {"type": "http.response.body", "body": text.encode()}
+        )
+
+    async def _read_body(receive) -> bytes:
+        body = b""
+        while True:
+            msg = await receive()
+            body += msg.get("body", b"")
+            if not msg.get("more_body", False):
+                break
+        return body
+
+    # -- ASGI app: OAuth + auth + MCP routing ------------------------------
 
     async def auth_app(scope, receive, send):
-        """ASGI app that checks bearer token then delegates to MCP."""
+        """ASGI app handling OAuth endpoints, auth, and MCP."""
         if scope["type"] == "lifespan":
             await session_manager.handle_request(scope, receive, send)
             return
 
-        # Check auth
-        if auth_token is not None:
-            headers = dict(scope.get("headers", []))
-            auth_value = headers.get(b"authorization", b"").decode()
-            if auth_value != f"Bearer {auth_token}":
-                await send(
-                    {
-                        "type": "http.response.start",
-                        "status": 401,
-                        "headers": [
-                            [b"content-type", b"text/plain"],
-                        ],
-                    }
-                )
-                await send(
-                    {
-                        "type": "http.response.body",
-                        "body": b"Unauthorized",
-                    }
+        path = scope.get("path", "")
+        method = scope.get("method", "GET")
+        headers = dict(scope.get("headers", []))
+
+        # -- OAuth metadata discovery -----------------------------------
+
+        if path == "/.well-known/oauth-protected-resource":
+            host = headers.get(b"host", b"localhost").decode()
+            scheme = "https" if "railway" in host else "http"
+            base = f"{scheme}://{host}"
+            await _send_json(
+                send,
+                200,
+                {
+                    "resource": f"{base}/mcp",
+                    "authorization_servers": [base],
+                },
+            )
+            return
+
+        if path == "/.well-known/oauth-authorization-server":
+            host = headers.get(b"host", b"localhost").decode()
+            scheme = "https" if "railway" in host else "http"
+            base = f"{scheme}://{host}"
+            await _send_json(
+                send,
+                200,
+                {
+                    "issuer": base,
+                    "token_endpoint": f"{base}/oauth/token",
+                    "grant_types_supported": [
+                        "client_credentials",
+                    ],
+                    "token_endpoint_auth_methods_supported": [
+                        "client_secret_post",
+                    ],
+                    "response_types_supported": ["token"],
+                },
+            )
+            return
+
+        # -- OAuth token endpoint ---------------------------------------
+
+        if path == "/oauth/token" and method == "POST":
+            if not client_id or not client_secret:
+                await _send_json(
+                    send,
+                    500,
+                    {"error": "server_error", "error_description": "OAuth not configured"},
                 )
                 return
 
-        # Route /mcp to session manager
-        path = scope.get("path", "")
+            body = await _read_body(receive)
+            from urllib.parse import parse_qs
+
+            params = parse_qs(body.decode())
+            req_grant = params.get("grant_type", [None])[0]
+            req_id = params.get("client_id", [None])[0]
+            req_secret = params.get("client_secret", [None])[0]
+
+            if req_grant != "client_credentials":
+                await _send_json(
+                    send,
+                    400,
+                    {"error": "unsupported_grant_type"},
+                )
+                return
+
+            if req_id != client_id or req_secret != client_secret:
+                await _send_json(
+                    send,
+                    401,
+                    {"error": "invalid_client"},
+                )
+                return
+
+            await _send_json(
+                send,
+                200,
+                {
+                    "access_token": access_token,
+                    "token_type": "Bearer",
+                    "expires_in": 86400,
+                },
+            )
+            return
+
+        # -- MCP endpoint (auth required) -------------------------------
+
         if path == "/mcp" or path == "/mcp/":
+            if access_token is not None:
+                auth_value = headers.get(
+                    b"authorization", b""
+                ).decode()
+                if auth_value != f"Bearer {access_token}":
+                    await _send_json(
+                        send,
+                        401,
+                        {"error": "invalid_token"},
+                    )
+                    return
+
             await session_manager.handle_request(
                 scope, receive, send
             )
-        else:
-            await send(
-                {
-                    "type": "http.response.start",
-                    "status": 404,
-                    "headers": [
-                        [b"content-type", b"text/plain"],
-                    ],
-                }
-            )
-            await send(
-                {
-                    "type": "http.response.body",
-                    "body": b"Not Found",
-                }
-            )
+            return
+
+        await _send_text(send, 404, "Not Found")
 
     # -- Starlette wrapper for lifespan ---------------------------------
 
