@@ -27,9 +27,11 @@ import contextlib
 import hashlib
 import json
 import os
+import secrets
 import tempfile
 import traceback
 from collections.abc import AsyncIterator
+from urllib.parse import parse_qs, urlencode
 
 import analytics_mcp.coordinator as coordinator
 from mcp.server.lowlevel import NotificationOptions
@@ -127,6 +129,9 @@ def run_http_server():
         _make_access_token(client_secret) if client_secret else None
     )
 
+    # In-memory store for auth codes (code -> code_challenge)
+    auth_codes: dict[str, str] = {}
+
     session_manager = StreamableHTTPSessionManager(
         app=coordinator.app,
         json_response=False,
@@ -162,6 +167,18 @@ def run_http_server():
             {"type": "http.response.body", "body": text.encode()}
         )
 
+    async def _send_redirect(send, url):
+        await send(
+            {
+                "type": "http.response.start",
+                "status": 302,
+                "headers": [
+                    [b"location", url.encode()],
+                ],
+            }
+        )
+        await send({"type": "http.response.body", "body": b""})
+
     async def _read_body(receive) -> bytes:
         body = b""
         while True:
@@ -170,6 +187,11 @@ def run_http_server():
             if not msg.get("more_body", False):
                 break
         return body
+
+    def _get_base_url(headers):
+        host = headers.get(b"host", b"localhost").decode()
+        scheme = "https" if "railway" in host else "http"
+        return f"{scheme}://{host}"
 
     # -- ASGI app: OAuth + auth + MCP routing ------------------------------
 
@@ -186,9 +208,7 @@ def run_http_server():
         # -- OAuth metadata discovery -----------------------------------
 
         if path == "/.well-known/oauth-protected-resource":
-            host = headers.get(b"host", b"localhost").decode()
-            scheme = "https" if "railway" in host else "http"
-            base = f"{scheme}://{host}"
+            base = _get_base_url(headers)
             await _send_json(
                 send,
                 200,
@@ -200,69 +220,158 @@ def run_http_server():
             return
 
         if path == "/.well-known/oauth-authorization-server":
-            host = headers.get(b"host", b"localhost").decode()
-            scheme = "https" if "railway" in host else "http"
-            base = f"{scheme}://{host}"
+            base = _get_base_url(headers)
             await _send_json(
                 send,
                 200,
                 {
                     "issuer": base,
+                    "authorization_endpoint": f"{base}/authorize",
                     "token_endpoint": f"{base}/oauth/token",
+                    "registration_endpoint": (
+                        f"{base}/oauth/register"
+                    ),
                     "grant_types_supported": [
-                        "client_credentials",
+                        "authorization_code",
                     ],
+                    "code_challenge_methods_supported": ["S256"],
                     "token_endpoint_auth_methods_supported": [
                         "client_secret_post",
                     ],
-                    "response_types_supported": ["token"],
+                    "response_types_supported": ["code"],
                 },
             )
             return
 
-        # -- OAuth token endpoint ---------------------------------------
+        # -- Dynamic client registration --------------------------------
+
+        if path == "/oauth/register" and method == "POST":
+            body = await _read_body(receive)
+            reg = json.loads(body) if body else {}
+            await _send_json(
+                send,
+                201,
+                {
+                    "client_id": client_id or "mcp-client",
+                    "client_secret": client_secret or "",
+                    "redirect_uris": reg.get(
+                        "redirect_uris", []
+                    ),
+                },
+            )
+            return
+
+        # -- Authorization endpoint -------------------------------------
+
+        if path == "/authorize" and method == "GET":
+            qs = scope.get("query_string", b"").decode()
+            params = parse_qs(qs)
+            req_client_id = params.get("client_id", [None])[0]
+            redirect_uri = params.get("redirect_uri", [None])[0]
+            state = params.get("state", [None])[0]
+            code_challenge = params.get(
+                "code_challenge", [None]
+            )[0]
+
+            if not redirect_uri:
+                await _send_text(
+                    send, 400, "Missing redirect_uri"
+                )
+                return
+
+            if (
+                client_id
+                and req_client_id
+                and req_client_id != client_id
+            ):
+                await _send_text(
+                    send, 401, "Invalid client_id"
+                )
+                return
+
+            # Generate auth code and store with its challenge
+            code = secrets.token_urlsafe(32)
+            auth_codes[code] = code_challenge or ""
+
+            # Redirect back to claude.ai with the code
+            redirect_params = {"code": code}
+            if state:
+                redirect_params["state"] = state
+            redirect_url = (
+                f"{redirect_uri}?{urlencode(redirect_params)}"
+            )
+            await _send_redirect(send, redirect_url)
+            return
+
+        # -- Token endpoint ---------------------------------------------
 
         if path == "/oauth/token" and method == "POST":
             if not client_id or not client_secret:
                 await _send_json(
                     send,
                     500,
-                    {"error": "server_error", "error_description": "OAuth not configured"},
+                    {
+                        "error": "server_error",
+                        "error_description": "OAuth not configured",
+                    },
                 )
                 return
 
             body = await _read_body(receive)
-            from urllib.parse import parse_qs
-
             params = parse_qs(body.decode())
             req_grant = params.get("grant_type", [None])[0]
             req_id = params.get("client_id", [None])[0]
             req_secret = params.get("client_secret", [None])[0]
 
-            if req_grant != "client_credentials":
-                await _send_json(
-                    send,
-                    400,
-                    {"error": "unsupported_grant_type"},
-                )
-                return
+            if req_grant == "authorization_code":
+                code = params.get("code", [None])[0]
+                code_verifier = params.get(
+                    "code_verifier", [None]
+                )[0]
 
-            if req_id != client_id or req_secret != client_secret:
+                if not code or code not in auth_codes:
+                    await _send_json(
+                        send, 400, {"error": "invalid_grant"}
+                    )
+                    return
+
+                # Verify PKCE challenge
+                stored_challenge = auth_codes.pop(code)
+                if stored_challenge and code_verifier:
+                    computed = (
+                        hashlib.sha256(code_verifier.encode())
+                        .digest()
+                    )
+                    import base64
+
+                    expected = (
+                        base64.urlsafe_b64encode(computed)
+                        .rstrip(b"=")
+                        .decode()
+                    )
+                    if expected != stored_challenge:
+                        await _send_json(
+                            send,
+                            400,
+                            {"error": "invalid_grant"},
+                        )
+                        return
+
                 await _send_json(
                     send,
-                    401,
-                    {"error": "invalid_client"},
+                    200,
+                    {
+                        "access_token": access_token,
+                        "token_type": "Bearer",
+                        "expires_in": 86400,
+                    },
                 )
                 return
 
             await _send_json(
                 send,
-                200,
-                {
-                    "access_token": access_token,
-                    "token_type": "Bearer",
-                    "expires_in": 86400,
-                },
+                400,
+                {"error": "unsupported_grant_type"},
             )
             return
 
